@@ -64,147 +64,93 @@ module Searchable
       hash
     end
 
-    # Search in title and content fields for `query`, include highlights in response
+    # Search in title and content fields for `q`, include highlights in response
     #
-    # @param query [String] The user query
+    # @param q [String] The user query
     # @return [Elasticsearch::Model::Response::Response]
     #
-    def self.search(query, options={})
+    def self.search(q, options={})
+      @search_definition = Elasticsearch::DSL::Search.search do
+        query do
+          unless q.blank?
+            bool do
+              should do
+                multi_match do
+                  query    q
+                  fields   ['title^10', 'abstract^2', 'content']
+                  operator 'and'
+                end
+              end
+            end
+          else
+            match_all
+          end
+        end
 
-      # Prefill and set the filters (top-level `filter` and `facet_filter` elements)
-      #
-      __set_filters = lambda do |key, f|
+        # TODO: Search also in *comments* -- `if query.present? && options[:comments]`
 
-        @search_definition[:filter][:and] ||= []
-        @search_definition[:filter][:and]  |= [f]
+        aggregation :categories do
+          # TODO: Has to be an `and` filter depending on multiple conditions
+          #       Would be nice to do this ex post, as with the original `__set_filters` lambda
+          #
+          f = options[:author] ? { term: { 'authors.full_name.raw' => options[:author] } } : { match_all: {} }
 
-        @search_definition[:facets][key.to_sym][:facet_filter][:and] ||= []
-        @search_definition[:facets][key.to_sym][:facet_filter][:and]  |= [f]
-      end
+          filter f do
+            aggregation :categories do
+              terms field: 'categories'
+            end
+          end
+        end
 
-      @search_definition = {
-        query: {},
+        aggregation :authors do
+          # DITTO
+          f = options[:category] ? { term: { categories: options[:category] } } : { match_all: {} }
 
-        highlight: {
-          pre_tags: ['<em class="label label-highlight">'],
-          post_tags: ['</em>'],
-          fields: {
+          filter f do
+            aggregation :authors do
+              terms field: 'authors.full_name.raw'
+            end
+          end
+        end
+
+        aggregation :published do
+          # DITTO
+          f = options[:category] ? { term: { categories: options[:category] } } : { match_all: {} }
+
+          filter f do
+            aggregation :published do
+              date_histogram do
+                field    'published_on'
+                interval 'week'
+              end
+            end
+          end
+        end
+
+        highlight fields: {
             title:    { number_of_fragments: 0 },
             abstract: { number_of_fragments: 0 },
             content:  { fragment_size: 50 }
-          }
-        },
-
-        filter: {},
-
-        facets: {
-          categories: {
-            terms: {
-              field: 'categories'
-            },
-            facet_filter: {}
           },
-          authors: {
-            terms: {
-              field: 'authors.full_name.raw'
-            },
-            facet_filter: {}
-          },
-          published: {
-            date_histogram: {
-              field: 'published_on',
-              interval: 'week'
-            },
-            facet_filter: {}
-          }
-        }
-      }
+          pre_tags: ['<em class="label label-highlight">'],
+          post_tags: ['</em>']
 
-      unless query.blank?
-        @search_definition[:query] = {
-          bool: {
-            should: [
-              { multi_match: {
-                  query: query,
-                  fields: ['title^10', 'abstract^2', 'content'],
-                  operator: 'and'
-                }
-              }
-            ]
-          }
-        }
-      else
-        @search_definition[:query] = { match_all: {} }
-        @search_definition[:sort]  = { published_on: 'desc' }
+        case
+          when options[:sort]
+            sort options[:sort].to_sym => 'desc'
+            track_scores true
+          when q.blank?
+            sort published_on: 'desc'
+        end
+
+        unless q.blank?
+          suggest :suggest_title, text: q, term: { field: 'title.tokenized', suggest_mode: 'always' }
+          suggest :suggest_body,  text: q, term: { field: 'content.tokenized', suggest_mode: 'always' }
+        end
+
       end
 
-      if options[:category]
-        f = { term: { categories: options[:category] } }
-
-        __set_filters.(:authors, f)
-        __set_filters.(:published, f)
-      end
-
-      if options[:author]
-        f = { term: { 'authors.full_name.raw' => options[:author] } }
-
-        __set_filters.(:categories, f)
-        __set_filters.(:published, f)
-      end
-
-      if options[:published_week]
-        f = {
-          range: {
-            published_on: {
-              gte: options[:published_week],
-              lte: "#{options[:published_week]}||+1w"
-            }
-          }
-        }
-
-        __set_filters.(:categories, f)
-        __set_filters.(:authors, f)
-      end
-
-      if query.present? && options[:comments]
-        @search_definition[:query][:bool][:should] ||= []
-        @search_definition[:query][:bool][:should] << {
-          nested: {
-            path: 'comments',
-            query: {
-              multi_match: {
-                query: query,
-                fields: ['body'],
-                operator: 'and'
-              }
-            }
-          }
-        }
-        @search_definition[:highlight][:fields].update 'comments.body' => { fragment_size: 50 }
-      end
-
-      if options[:sort]
-        @search_definition[:sort]  = { options[:sort] => 'desc' }
-        @search_definition[:track_scores] = true
-      end
-
-      unless query.blank?
-        @search_definition[:suggest] = {
-          text: query,
-          suggest_title: {
-            term: {
-              field: 'title.tokenized',
-              suggest_mode: 'always'
-            }
-          },
-          suggest_body: {
-            term: {
-              field: 'content.tokenized',
-              suggest_mode: 'always'
-            }
-          }
-        }
-      end
+      # require 'pry'; binding.pry;
 
       __elasticsearch__.search(@search_definition)
     end
